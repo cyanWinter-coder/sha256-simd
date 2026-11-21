@@ -62,6 +62,45 @@ Note that, because of the scheduling overhead, for small messages (< 1 MB) you w
 
 More detailed information can be found in this [blog](https://blog.minio.io/accelerate-sha256-up-to-8x-over-3-gb-s-per-core-with-avx512-a0b1d64f78f) post including scaling across cores.
 
+## Bounded batch hashing
+
+Hashing one object at a time cannot share hardware lanes, and a burst of
+objects can pin a lot of CPU and input memory at once. `Batch` hashes many
+independent inputs through a bounded number of lanes, while leaving the
+standard `hash.Hash` API untouched:
+
+```go
+batch, err := sha256.NewBatch(sha256.BatchOptions{
+	Lanes:         16,      // digests computed concurrently
+	BatchSize:     16,      // inputs per batch step
+	MaxInputBytes: 8 << 20, // in-flight input bytes before backpressure
+})
+if err != nil {
+	return err
+}
+
+digests, err := batch.Sum256(ctx, objects)
+// digests[i] is the 32-byte digest of objects[i].
+```
+
+* `Sum256` returns one digest per input, in input order. `Sum(ctx, inputs,
+  sums)` writes into caller buffers instead and validates every destination
+  independently (`ErrShortBuffer` names the offending index).
+* `Lanes`, `BatchSize` and `MaxInputBytes` default to the matching
+  `DefaultBatch*` constants. Inputs are never copied: when the byte limit is
+  reached, the batch stops admitting work until in-flight groups drain.
+* If `ctx` is canceled, completed digests are kept, entries that did not
+  finish are left as an explicit all-zero placeholder, and the returned
+  `*IncompleteError` lists their indices. A partially hashed message is never
+  published. Both `errors.Is(err, ErrBatchIncomplete)` and the underlying
+  `context.Canceled`/`DeadlineExceeded` match.
+* On AVX512 capable amd64 CPUs each lane group uses the 16-way assembly
+  routine; ARM and the pure-Go fallback produce byte-for-byte identical
+  digests, and the hardware path is selected transparently.
+* A `Batch` may be shared between goroutines and keeps no reference to the
+  input slices after a call returns. `Sum256Batch` is a convenience wrapper
+  around a process-wide `Batch` using the defaults.
+
 ## Drop-In Replacement
 
 The following code snippet shows how you can use `github.com/minio/sha256-simd`. 
